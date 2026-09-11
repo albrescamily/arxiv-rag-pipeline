@@ -7,43 +7,81 @@ import feedparser
 base_url = "https://export.arxiv.org/api/query"
 
 
+def parse_entry(entry) -> dict:
 
-def fetch_page(search_query:str, start:int, batch_size:int, session=None):
+    paper = {
+        "id": entry.id.split("/abs/")[-1],
+        "title": entry.title.strip(),
+        "summary": entry.summary.strip(),
+        "published": entry.published,
+        "updated": entry.updated,
+        "authors": [
+            author.name
+            for author in entry.authors
+        ],
+
+        "categories": [
+            tag["term"]
+            for tag in entry.tags
+        ]
+    }
+
+    return paper
+
+
+def fetch_page(
+    search_query: str,
+    start: int,
+    batch_size: int,
+    session=None
+):
     params = {
         "search_query": search_query,
         "start": start,
         "max_results": batch_size,
         "sortBy": "submittedDate",
-        "sortOrder": "ascending" #top of the last doesnt move
+        "sortOrder": "ascending"
     }
 
-    # reuse the caller's connection when there is one, so paging skips the tls handshake
+    # reuse connection between requests
     requester = session or requests
 
-    response = requester.get(base_url, params=params, timeout=(5, 30))
+    response = requester.get(
+        base_url,
+        params=params,
+        timeout=(5, 30)
+    )
+
     response.raise_for_status()
 
     feed = feedparser.parse(response.content)
 
+    # malformed XML/feed
     if feed.bozo:
-        raise ValueError(f"malformed feed: {feed.bozo_exception}")
+        raise ValueError(
+            f"Malformed feed: {feed.bozo_exception}"
+        )
 
-    # arxiv answers 200 with an error feed instead of a failing status code
-    if len(feed.entries) == 1 and "api/errors" in feed.entries[0].id:
-        raise ValueError(f"arxiv rejected the query: {feed.entries[0].summary}")
+    # arxiv can return HTTP 200 with an API error inside the feed
+    if (
+        len(feed.entries) == 1
+        and "api/errors" in feed.entries[0].id
+    ):
+        raise ValueError(
+            f"arXiv rejected the query: "
+            f"{feed.entries[0].summary}"
+        )
 
     return feed
 
 
-def fetch_raw_data(search_query:str, max_results:int|None=None, batch_size:int=2000, wait_time:int=3):
-
+def _iter_pages(
+    search_query: str,
+    batch_size: int,
+    wait_time: int = 3
+):
     start = 0
-    limit = None
-    papers = []
-
-    # never ask for more per call than the caller wants in total
-    if max_results is not None:
-        batch_size = min(batch_size, max_results)
+    total = None
 
     with requests.Session() as session:
 
@@ -51,56 +89,106 @@ def fetch_raw_data(search_query:str, max_results:int|None=None, batch_size:int=2
 
             began = time.monotonic()
 
-            feed = fetch_page(search_query, start, batch_size, session=session)
+            # avoid requesting more entries than remain
+            current_batch_size = batch_size
 
-            # first pass only: arxiv tells us how many results the query really has
-            if limit is None:
-                total = int(feed.feed.opensearch_totalresults)
+            if total is not None:
+                current_batch_size = min(
+                    batch_size,
+                    total - start
+                )
+
+            feed = fetch_page(
+                search_query=search_query,
+                start=start,
+                batch_size=current_batch_size,
+                session=session
+            )
+
+            # first request tells us how many results exist
+            if total is None:
+
+                total = int(
+                    feed.feed.opensearch_totalresults
+                )
+                print(total)
+
                 if total == 0:
-                    return []
-                limit = total if max_results is None else min(max_results, total)
+                    return
 
-            # arxiv sometimes returns an empty page while more results exist
+            # do not silently finish an incomplete extraction
             if not feed.entries:
-                break
+                raise RuntimeError(
+                    f"Empty page returned by arXiv "
+                    f"at start={start}/{total}"
+                )
+
+            papers = []
 
             for entry in feed.entries:
-                paper = {
-                    "id": entry.id.split("/abs/")[-1],
-                    "title": entry.title,
-                    "summary": entry.summary,
-                    "published": entry.published,
-                    "updated": entry.updated,
-                    "authors": [
-                        author.name
-                        for author in entry.authors
-                    ],
-                }
+
+                paper = parse_entry(entry)
 
                 papers.append(paper)
 
-            # advance by what actually came back, not by what we asked for
+            # return one batch at a time
+            yield papers
+
+            # advance by the number actually received
             start += len(feed.entries)
 
-            if start >= limit:
+            if start >= total:
                 break
 
-            # last page only needs the remainder
-            batch_size = min(batch_size, limit - start)
-
-            # the 3s arxiv asks for counts from the start of the request, not from now
+            # respect interval between requests
             elapsed = time.monotonic() - began
-            time.sleep(max(0, wait_time - elapsed))
 
-    return papers[:limit]
+            time.sleep(
+                max(0, wait_time - elapsed)
+            )
 
 
-if __name__ == "__main__":
-    papers = fetch_raw_data(
-        search_query="all:biophysics",
-        max_results=10,
-    )
+def fetch_raw_data(
+    search_query: str,
+    batch_size: int,
+    wait_time: int = 3
+):
+    # flatten the per-page batches into one list -- Airflow's TaskFlow
+    # return value is pushed to XCom as JSON, and a live generator
+    # can't be serialized (and callers shouldn't have to know about paging)
+    papers = []
 
-    print(f"{len(papers)} papers")
-    for paper in papers:
-        print(paper["title"])
+    for batch in _iter_pages(
+        search_query=search_query,
+        batch_size=batch_size,
+        wait_time=wait_time
+    ):
+        papers.extend(batch)
+
+    return papers
+
+
+# if __name__ == "__main__":
+
+#     search_query = (
+#         "cat:cs.AI OR "
+#         "cat:cs.LG OR "
+#         "cat:cs.CL"
+#     )
+
+#     total = 0
+
+#     for batch in fetch_raw_data(
+#         search_query=search_query,
+#         batch_size=5
+#     ):
+
+#         total += len(batch)
+
+#         print(
+#             f"Received {len(batch)} papers "
+#             f"- total: {total}"
+#         )
+
+#         for paper in batch:
+#             print(paper["title"])
