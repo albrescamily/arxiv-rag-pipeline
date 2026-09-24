@@ -1,0 +1,23 @@
+name: arxiv-db
+
+services:
+  arxiv-db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${ARXIV_DB_USER:-arxiv}
+      POSTGRES_PASSWORD: ${ARXIV_DB_PASSWORD:-arxiv}
+      POSTGRES_DB: ${ARXIV_DB_NAME:-arxiv}
+    ports:
+      # 5433 on the host so it doesn't clash with a local Postgres
+      - "5433:5432"
+    volumes:
+      - arxiv-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+volumes:
+  arxiv-db-volume:
